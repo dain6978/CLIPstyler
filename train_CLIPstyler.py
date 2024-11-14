@@ -5,6 +5,7 @@ import torch
 import torch.nn
 import torch.optim as optim
 from torchvision import transforms, models
+from torchvision.models import VGG19_Weights
 
 import StyleNet
 import utils
@@ -17,6 +18,12 @@ import PIL
 from torchvision import utils as vutils
 import argparse
 from torchvision.transforms.functional import adjust_contrast
+
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
+
+import time
+
 
 parser = argparse.ArgumentParser()
 
@@ -32,7 +39,7 @@ parser.add_argument('--lambda_tv', type=float, default=2e-3,
                     help='total variation loss parameter')
 parser.add_argument('--lambda_patch', type=float, default=9000,
                     help='PatchCLIP loss parameter')
-parser.add_argument('--lambda_dir', type=float, default=500,
+parser.add_argument('--lambda_dir', type=float, default=600,
                     help='directional loss parameter')
 parser.add_argument('--lambda_c', type=float, default=150,
                     help='content loss parameter')
@@ -57,12 +64,30 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 assert (args.img_width%8)==0, "width must be multiple of 8"
 assert (args.img_height%8)==0, "height must be multiple of 8"
 
-VGG = models.vgg19(pretrained=True).features
+height = args.img_height
+width = args.img_width
+
+VGG = models.vgg19(weights=VGG19_Weights.DEFAULT).features
 VGG.to(device)
 
 for parameter in VGG.parameters():
     parameter.requires_grad_(False)
-    
+
+
+upscale_model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+upscaler_path = "RealESRGAN_x4plus.pth"
+
+upscaler = RealESRGANer(
+    scale=4, 
+    model_path=upscaler_path,
+    model=upscale_model, 
+    tile=0,
+    tile_pad=10,
+    pre_pad=10
+)
+upscaler.model.to(device)
+
+
 def img_denormalize(image):
     mean=torch.tensor([0.485, 0.456, 0.406]).to(device)
     std=torch.tensor([0.229, 0.224, 0.225]).to(device)
@@ -105,15 +130,31 @@ def get_image_prior_losses(inputs_jit):
 def compose_text_with_templates(text: str, templates=imagenet_templates) -> list:
     return [template.format(text) for template in templates]
 
+
+def upscale_image(image_tensor):
+    #image_tensor: (B, C, H, W), (float, (0~1)) (= ouput tensor)
+    #image_np: (H, W, C)
+    image_np = image_tensor.detach().squeeze().cpu().numpy()  
+    image_np = np.moveaxis(image_np, 0, -1) 
+    image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
+    
+    # upscaler.enhance input & output: uint8, (0~255)
+    upscaled_image_np = upscaler.enhance(image_np, outscale=4)[0]
+    
+    upscaled_tensor = torch.from_numpy(np.moveaxis(upscaled_image_np, -1, 0)).unsqueeze(0).to(device) 
+    upscaled_tensor = torch.clamp(upscaled_tensor.float() / 255.0, 0.0, 1.0)
+   
+    return upscaled_tensor
+
+
 content_path = args.content_path
-content_image = utils.load_image2(content_path, img_height=args.img_height,img_width=args.img_width)
 content = args.content_name
 exp = args.exp_name
 
+content_image = utils.load_image2(content_path, img_height=height,img_width=width)
 content_image = content_image.to(device)
 
 content_features = utils.get_features(img_normalize(content_image), VGG)
-
 target = content_image.clone().requires_grad_(True).to(device)
 
 style_net = StyleNet.UNet()
@@ -141,40 +182,88 @@ output_image = content_image
 m_cont = torch.mean(content_image,dim=(2,3),keepdim=False).squeeze(0)
 m_cont = [m_cont[0].item(),m_cont[1].item(),m_cont[2].item()]
 
-cropper = transforms.Compose([
-    transforms.RandomCrop(args.crop_size)
-])
+
+default_crop_size = args.crop_size
+window_size = 3
+activation_average = content_features['conv4_2'][:,:,:,:].mean().item()
+
+def adjust_crop_size(center_x, center_y):
+    y1_img = max(0, center_y - window_size // 2)
+    y2_img = min(height, center_y + window_size // 2)
+    x1_img = max(0, center_x - window_size // 2)
+    x2_img = min(width, center_x + window_size // 2)
+
+    scale_y = content_features['conv4_2'].shape[2] / height
+    scale_x = content_features['conv4_2'].shape[3] / width
+    
+    y1_feat = int(y1_img * scale_y)
+    y2_feat = int(y2_img * scale_y) + 1
+    x1_feat = int(x1_img * scale_x)
+    x2_feat = int(x2_img * scale_x) + 1
+
+    activation_value = content_features['conv4_2'][:, :, y1_feat:y2_feat, x1_feat:x2_feat].mean().item()
+    
+    threshold = activation_average
+    if activation_value > threshold:  
+        crop_size = default_crop_size // 2  
+    else:
+        crop_size = default_crop_size
+    return crop_size 
+
+
+def cropper(image, crop_size, center_x, center_y):
+    crop_y1 = max(0, center_y - crop_size // 2)
+    crop_y2 = min(height, center_y + crop_size // 2)
+    crop_x1 = max(0, center_x - crop_size // 2)
+    crop_x2 = min(width, center_x + crop_size // 2)
+
+    crop_image = image[:, :, crop_y1:crop_y2, crop_x1:crop_x2]
+    return crop_image
+
 augment = transforms.Compose([
-    transforms.RandomPerspective(fill=0, p=1,distortion_scale=0.5),
+    transforms.RandomPerspective(p=1,distortion_scale=0.5),
     transforms.Resize(224)
 ])
+
+
 device='cuda'
 clip_model, preprocess = clip.load('ViT-B/32', device, jit=False)
 
-prompt = args.text
-
-source = "a Photo"
+style_text = args.text
+source_text = "a Photo"
 
 with torch.no_grad():
-    template_text = compose_text_with_templates(prompt, imagenet_templates)
-    tokens = clip.tokenize(template_text).to(device)
-    text_features = clip_model.encode_text(tokens).detach()
-    text_features = text_features.mean(axis=0, keepdim=True)
-    text_features /= text_features.norm(dim=-1, keepdim=True)
+    template_style = compose_text_with_templates(style_text, imagenet_templates)
+    tokens_style = clip.tokenize(template_style).to(device)
+    style_text_features = clip_model.encode_text(tokens_style).detach()
+    style_text_features = style_text_features.mean(axis=0, keepdim=True)
+    style_text_features /= style_text_features.norm(dim=-1, keepdim=True)
     
-    template_source = compose_text_with_templates(source, imagenet_templates)
+    template_source = compose_text_with_templates(source_text, imagenet_templates)
     tokens_source = clip.tokenize(template_source).to(device)
-    text_source = clip_model.encode_text(tokens_source).detach()
-    text_source = text_source.mean(axis=0, keepdim=True)
-    text_source /= text_source.norm(dim=-1, keepdim=True)
-    source_features = clip_model.encode_image(clip_normalize(content_image,device))
-    source_features /= (source_features.clone().norm(dim=-1, keepdim=True))
+    source_text_features = clip_model.encode_text(tokens_source).detach()
+    source_text_features = source_text_features.mean(axis=0, keepdim=True)
+    source_text_features /= source_text_features.norm(dim=-1, keepdim=True)
+    
+    source_image_features = clip_model.encode_image(clip_normalize(content_image,device))
+    source_image_features /= (source_image_features.clone().norm(dim=-1, keepdim=True))
 
     
 num_crops = args.num_crops
+
+start_time = time.time()
+total_allocated_memory = 0
+total_reserved_memory = 0
+
+
 for epoch in range(0, steps+1):
-    
-    scheduler.step()
+    optimizer.zero_grad()
+
+    allocated_memory = torch.cuda.memory_allocated()
+    reserved_memory = torch.cuda.memory_reserved()
+    total_allocated_memory += allocated_memory
+    total_reserved_memory += reserved_memory
+
     target = style_net(content_image,use_sigmoid=True).to(device)
     target.requires_grad_(True)
     
@@ -188,7 +277,11 @@ for epoch in range(0, steps+1):
     loss_patch=0 
     img_proc =[]
     for n in range(num_crops):
-        target_crop = cropper(target)
+        center_y = np.random.randint(default_crop_size // 2, height - (default_crop_size // 2))
+        center_x = np.random.randint(default_crop_size // 2, width - (default_crop_size // 2))
+
+        crop_size = adjust_crop_size(center_x, center_y)
+        target_crop = cropper(target, crop_size, center_x, center_y)
         target_crop = augment(target_crop)
         img_proc.append(target_crop)
 
@@ -197,11 +290,11 @@ for epoch in range(0, steps+1):
 
     image_features = clip_model.encode_image(clip_normalize(img_aug,device))
     image_features /= (image_features.clone().norm(dim=-1, keepdim=True))
-    
-    img_direction = (image_features-source_features)
+
+    img_direction = (image_features-source_image_features)
     img_direction /= img_direction.clone().norm(dim=-1, keepdim=True)
     
-    text_direction = (text_features-text_source).repeat(image_features.size(0),1)
+    text_direction = (style_text_features-source_text_features).repeat(image_features.size(0),1)
     text_direction /= text_direction.norm(dim=-1, keepdim=True)
     loss_temp = (1- torch.cosine_similarity(img_direction, text_direction, dim=1))
     loss_temp[loss_temp<args.thresh] =0
@@ -210,7 +303,7 @@ for epoch in range(0, steps+1):
     glob_features = clip_model.encode_image(clip_normalize(target,device))
     glob_features /= (glob_features.clone().norm(dim=-1, keepdim=True))
     
-    glob_direction = (glob_features-source_features)
+    glob_direction = (glob_features-source_image_features)
     glob_direction /= glob_direction.clone().norm(dim=-1, keepdim=True)
     
     loss_glob = (1- torch.cosine_similarity(glob_direction, text_direction, dim=1)).mean()
@@ -223,6 +316,7 @@ for epoch in range(0, steps+1):
     optimizer.zero_grad()
     total_loss.backward()
     optimizer.step()
+    scheduler.step()
 
     if epoch % 20 == 0:
         print("After %d criterions:" % epoch)
@@ -232,14 +326,26 @@ for epoch in range(0, steps+1):
         print('dir loss: ', loss_glob.item())
         print('TV loss: ', reg_tv.item())
     
-    if epoch %50 ==0:
-        out_path = './outputs/'+prompt+'_'+content+'_'+exp+'.jpg'
+    if epoch % 50 == 0:
+        out_path = './outputs/'+style_text+'_'+content+'_'+exp+'.jpg'
         output_image = target.clone()
         output_image = torch.clamp(output_image,0,1)
         output_image = adjust_contrast(output_image,1.5)
+        if (epoch == steps):
+           output_image = upscale_image(output_image)
         vutils.save_image(
                                     output_image,
                                     out_path,
                                     nrow=1,
                                     normalize=True)
 
+
+end_time = time.time()
+total_time = end_time - start_time 
+print(f'Total execution Time: {end_time - start_time:.2f} seconds')
+
+final_allocated_memory = torch.cuda.memory_allocated()
+final_reserved_memory = torch.cuda.memory_reserved()
+
+print(f"Total Allocated Memory: {total_allocated_memory / (1024 ** 3):.2f} GB")
+print(f"Total Reserved Memory: {total_reserved_memory / (1024 ** 3):.2f} GB")
