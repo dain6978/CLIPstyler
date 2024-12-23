@@ -11,7 +11,7 @@ import StyleNet
 import utils
 import clip
 import torch.nn.functional as F
-from template import imagenet_templates
+import template as T
 
 from PIL import Image 
 import PIL 
@@ -43,6 +43,8 @@ parser.add_argument('--lambda_dir', type=float, default=600,
                     help='directional loss parameter')
 parser.add_argument('--lambda_c', type=float, default=150,
                     help='content loss parameter')
+parser.add_argument('--lambda_act', type=float, default=0,
+                    help='activation value parameter')     
 parser.add_argument('--crop_size', type=int, default=128,
                     help='cropped image size')
 parser.add_argument('--num_crops', type=int, default=64,
@@ -56,6 +58,8 @@ parser.add_argument('--max_step', type=int, default=200,
 parser.add_argument('--lr', type=float, default=5e-4,
                     help='Number of domains')
 parser.add_argument('--thresh', type=float, default=0.7,
+                    help='Number of domains')
+parser.add_argument('--graphic', type=str, default="mid",
                     help='Number of domains')
 args = parser.parse_args()
 
@@ -127,7 +131,8 @@ def get_image_prior_losses(inputs_jit):
     
     return loss_var_l2
 
-def compose_text_with_templates(text: str, templates=imagenet_templates) -> list:
+
+def compose_text_with_templates(text: str, templates=T.imagenet_templates) -> list:
     return [template.format(text) for template in templates]
 
 
@@ -179,13 +184,11 @@ total_loss_epoch = []
 
 output_image = content_image
 
-m_cont = torch.mean(content_image,dim=(2,3),keepdim=False).squeeze(0)
-m_cont = [m_cont[0].item(),m_cont[1].item(),m_cont[2].item()]
-
 
 default_crop_size = args.crop_size
 window_size = 3
 activation_average = content_features['conv4_2'][:,:,:,:].mean().item()
+acitvation_weight = args.lambda_act
 
 def adjust_crop_size(center_x, center_y):
     y1_img = max(0, center_y - window_size // 2)
@@ -204,7 +207,7 @@ def adjust_crop_size(center_x, center_y):
     activation_value = content_features['conv4_2'][:, :, y1_feat:y2_feat, x1_feat:x2_feat].mean().item()
     
     threshold = activation_average
-    if activation_value > threshold:  
+    if activation_value > threshold - acitvation_weight:  
         crop_size = default_crop_size // 2  
     else:
         crop_size = default_crop_size
@@ -232,14 +235,21 @@ clip_model, preprocess = clip.load('ViT-B/32', device, jit=False)
 style_text = args.text
 source_text = "a Photo"
 
+graphic = args.graphic
+template_list = T.template_game_mapping.get(graphic)
+
+
 with torch.no_grad():
-    template_style = compose_text_with_templates(style_text, imagenet_templates)
+    template_style = compose_text_with_templates(style_text, template_list)
+    #template_style = compose_text_with_templates(style_text, T.imagenet_templates)
     tokens_style = clip.tokenize(template_style).to(device)
     style_text_features = clip_model.encode_text(tokens_style).detach()
     style_text_features = style_text_features.mean(axis=0, keepdim=True)
     style_text_features /= style_text_features.norm(dim=-1, keepdim=True)
     
-    template_source = compose_text_with_templates(source_text, imagenet_templates)
+    template_source = compose_text_with_templates(source_text, template_list)
+    #template_source = compose_text_with_templates(source_text, imagenet_templates)
+    #template_source = compose_text_with_templates(source_text, T.imagenet_templates_game)
     tokens_source = clip.tokenize(template_source).to(device)
     source_text_features = clip_model.encode_text(tokens_source).detach()
     source_text_features = source_text_features.mean(axis=0, keepdim=True)
@@ -327,15 +337,21 @@ for epoch in range(0, steps+1):
         print('TV loss: ', reg_tv.item())
     
     if epoch % 50 == 0:
-        out_path = './outputs/'+style_text+'_'+content+'_'+exp+'.jpg'
+        out_path1 = './outputs/'+style_text+'_'+content+'_'+exp+'.jpg'
+        out_path2 = './outputs/'+style_text+'_'+content+'_'+exp+'4x.jpg'
         output_image = target.clone()
         output_image = torch.clamp(output_image,0,1)
         output_image = adjust_contrast(output_image,1.5)
-        if (epoch == steps):
-           output_image = upscale_image(output_image)
         vutils.save_image(
                                     output_image,
-                                    out_path,
+                                    out_path1,
+                                    nrow=1,
+                                    normalize=True)
+        if (epoch == steps):
+            output_image = upscale_image(output_image)
+            vutils.save_image(
+                                    output_image,
+                                    out_path2,
                                     nrow=1,
                                     normalize=True)
 
